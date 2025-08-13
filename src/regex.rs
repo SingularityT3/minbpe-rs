@@ -1,6 +1,8 @@
 use fancy_regex::Regex;
 use indexmap::IndexMap;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
+use std::thread;
 
 use crate::{get_max_entry, Loadable, Saveable, Trainable};
 use crate::{get_stats, merge, update_stats, Token, Tokenizer};
@@ -319,6 +321,31 @@ impl Tokenizer for RegexTokenizerStruct {
     }
 }
 
+fn parallel_over_ids<T, F>(ids: &[Vec<Token>], op: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(&[Vec<Token>]) -> T + Sync,
+{
+    let num_threads = thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .min((ids.len() / 1_000_000).max(1));
+    
+    let chunk_size = (ids.len() + num_threads - 1) / num_threads;
+
+    thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_threads);
+        
+        for chunk in ids.chunks(chunk_size) {
+            handles.push(s.spawn(|| op(chunk)));
+        }
+
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    })
+}
+
 impl Trainable for RegexTokenizerStruct {
     fn train(&mut self, text: &str, vocab_size: Token, verbose: bool) {
         assert!(vocab_size >= 256, "Vocab size must be at least 256");
@@ -347,9 +374,20 @@ impl Trainable for RegexTokenizerStruct {
 
         for i in 0..num_merges {
             // Count the number of times every consecutive pair appears
-            let mut stats = IndexMap::new();
-            for chunk_ids in &ids {
-                update_stats(chunk_ids, &mut stats);
+            let thread_stats = parallel_over_ids(&ids, |thread_ids| {
+                let mut stats = IndexMap::new();
+                for chunk_ids in thread_ids {
+                    update_stats(chunk_ids, &mut stats);
+                }
+                stats
+            });
+
+            let mut iter = thread_stats.into_iter();
+            let mut stats = iter.next().unwrap();
+            for t_stats in iter {
+                for (k, v) in t_stats {
+                    *stats.entry(k).or_insert(0) += v;
+                }
             }
 
             // Find the pair with the highest count
@@ -359,10 +397,16 @@ impl Trainable for RegexTokenizerStruct {
             let idx = 256 + i;
 
             // Replace all occurrences of pair in ids with idx
-            ids = ids
-                .iter()
-                .map(|chunk_ids| merge(chunk_ids, *pair, idx))
-                .collect();
+            let new_ids = parallel_over_ids::<Vec<Vec<Token>>, _>(&ids, |thread_ids| {
+                thread_ids
+                    .iter()
+                    .map(|chunk_ids| merge(chunk_ids, *pair, idx))
+                    .collect()
+            });
+
+            let mut iter = new_ids.into_iter();
+            ids = iter.next().unwrap();
+            iter.for_each(|mut x| ids.append(&mut x));
 
             // Save the merge
             merges.insert(*pair, idx);
